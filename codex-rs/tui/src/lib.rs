@@ -1824,6 +1824,22 @@ async fn run_ratatui_app(
         },
     };
 
+    if let resume_picker::SessionSelection::Resume(target) = &session_selection {
+        let validation = startup_draft
+            .run_until(
+                &mut tui,
+                session_resume::validate_resume_target(&mut app_server, target.thread_id),
+            )
+            .await;
+        if let Err(err) = validation
+            .map_err(color_eyre::Report::from)
+            .and_then(|result| result)
+        {
+            shutdown_startup_session(Some(app_server), &mut terminal_restore_guard).await;
+            return Err(err);
+        }
+    }
+
     // Remote startup keeps its existing explicit --cd trust check. Resolving other
     // remote folders requires authoritative project-root information from the server.
     if !uses_remote_workspace || remote_cwd_override.is_some() {
@@ -2729,6 +2745,52 @@ requires_openai_auth = {requires_openai_auth}
             Default::default(),
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn startup_resume_rejects_guardian_thread() -> color_eyre::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let config = build_config(&temp_dir).await?;
+        let thread_id = write_session_rollout(
+            temp_dir.path(),
+            "2025-01-05T12-00-00",
+            "2025-01-05T12:00:00Z",
+            "Guardian review",
+            &config.model_provider_id,
+            config.cwd.as_path(),
+        )?;
+        let rollout_path = temp_dir
+            .path()
+            .join("sessions/2025/01/05")
+            .join(format!("rollout-2025-01-05T12-00-00-{thread_id}.jsonl"));
+        let rollout = std::fs::read_to_string(&rollout_path)?;
+        let (meta, history) = rollout.split_once('\n').expect("rollout has metadata");
+        let mut meta: serde_json::Value = serde_json::from_str(meta)?;
+        meta["payload"]["source"] = serde_json::json!({"subagent": {"other": "guardian"}});
+        meta["payload"]["parent_thread_id"] =
+            serde_json::json!("00000000-0000-0000-0000-000000000001");
+        std::fs::write(&rollout_path, format!("{meta}\n{history}"))?;
+
+        let state_db =
+            init_state_db_for_app_server_target(&config, &AppServerTarget::Embedded).await?;
+        let mut app_server = start_app_server_for_picker(
+            &config,
+            &AppServerTarget::Embedded,
+            Vec::new(),
+            LoaderOverrides::without_managed_config_for_tests(),
+            state_db,
+            Arc::new(EnvironmentManager::default_for_tests()),
+        )
+        .await?;
+        let error = session_resume::validate_resume_target(&mut app_server, thread_id)
+            .await
+            .expect_err("Guardian resume should be rejected");
+        insta::assert_snapshot!(error.to_string(), @"
+        Cannot resume a Guardian review thread.
+        Resume its parent session instead: codex resume 00000000-0000-0000-0000-000000000001
+        ");
+        app_server.shutdown().await?;
+        Ok(())
     }
 
     #[tokio::test]

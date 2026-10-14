@@ -532,10 +532,7 @@ impl App {
 
         crate::session_log::log_outbound_op(&op);
 
-        if self
-            .try_resolve_app_server_request(app_server, thread_id, &op)
-            .await?
-        {
+        if self.try_resolve_app_server_request(thread_id, &op).await? {
             return Ok(());
         }
 
@@ -1090,37 +1087,33 @@ impl App {
 
     pub(super) async fn try_resolve_app_server_request(
         &mut self,
-        app_server: &AppServerSession,
         thread_id: ThreadId,
         op: &AppCommand,
     ) -> Result<bool> {
         let Some(resolution) = self
             .pending_app_server_requests
-            .take_resolution(&thread_id.to_string(), op)
+            .take_resolution_record(&thread_id.to_string(), op)
             .map_err(|err| color_eyre::eyre::eyre!(err))?
         else {
             return Ok(false);
         };
+        let Some(reply) = resolution.request.reply else {
+            return Err(color_eyre::eyre::eyre!(
+                "Missing original app-server connection for pending request"
+            ));
+        };
 
-        match app_server
-            .resolve_server_request(resolution.request_id, resolution.result)
-            .await
-        {
-            Ok(()) => {
-                if ThreadEventStore::op_can_change_pending_replay_state(op) {
-                    self.note_thread_outbound_op(thread_id, op).await;
-                    self.refresh_pending_thread_approvals().await;
-                    self.refresh_side_parent_status_from_store(thread_id).await;
-                }
-                Ok(true)
-            }
-            Err(err) => {
-                self.chat_widget.add_error_message(format!(
-                    "Failed to resolve app-server request for thread {thread_id}: {err}"
-                ));
-                Ok(false)
-            }
+        if let Err(err) = reply.resolve(resolution.result).await {
+            self.chat_widget.add_error_message(format!(
+                "Failed to resolve app-server request for thread {thread_id}: {err}"
+            ));
         }
+        if ThreadEventStore::op_can_change_pending_replay_state(op) {
+            self.note_thread_outbound_op(thread_id, op).await;
+            self.refresh_pending_thread_approvals().await;
+            self.refresh_side_parent_status_from_store(thread_id).await;
+        }
+        Ok(true)
     }
 
     pub(super) async fn refresh_pending_thread_approvals(&mut self) {

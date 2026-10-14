@@ -407,6 +407,7 @@ libc = "0.2.182"
 # Keep SQLx's bundled SQLite on a version containing the WAL-reset corruption fix:
 # https://www.sqlite.org/wal.html#the_wal_reset_bug
 libsqlite3-sys = { version = "0.37", default-features = false }
+linkify = "0.11"
 log = "0.4"
 lru = "0.18.2"
 maplit = "1.0.2"

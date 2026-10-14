@@ -821,6 +821,69 @@ async fn spawn_failure_context_preserves_shutdown_during_child_startup() {
 }
 
 #[tokio::test]
+async fn cancelled_spawn_after_input_admission_discards_child() {
+    let harness = AgentControlHarness::new().await;
+    let state = harness.control.runtime.upgrade().expect("live manager");
+    let parent_id = ThreadId::new();
+    let mut spawn = harness.control.spawn(SpawnRequest {
+        caller: parent_id,
+        config: harness.config.clone(),
+        input: AgentInput::UserInput(text_input("child task")),
+        source: SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: parent_id,
+            depth: 1,
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: None,
+        }),
+        options: SpawnAgentOptions::default(),
+    });
+    let child = poll_fn(|cx| {
+        assert!(spawn.as_mut().poll(cx).is_pending());
+        let threads = state.threads.try_read().expect("uncontended manager");
+        // On this single-thread runtime the session loop cannot consume the first
+        // input until this poll returns. Leave spawn waiting for its admission reply.
+        match threads.values().find(|thread| !thread.io.tx_sub.is_empty()) {
+            Some(child) => Poll::Ready(Arc::clone(child)),
+            None => Poll::Pending,
+        }
+    })
+    .await;
+    let child_id = child.session.thread_id();
+    // This no-op goes through the same FIFO submission loop. Its receipt proves the
+    // earlier input has been admitted, without polling the spawn future again.
+    child
+        .update_thread_settings(ThreadSettingsOverrides::default())
+        .await
+        .expect("input admission completed before the settings barrier");
+    {
+        // Only the final status lookup now needs the manager lock. Cancel there,
+        // after input admission but before the backend can return its receipt.
+        let _threads = state.threads.write().await;
+        assert!(
+            spawn
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        drop(spawn);
+    }
+    assert!(
+        harness.control.get_agent_metadata(child_id).is_none(),
+        "cancelled spawn must not leave an accepted child registered"
+    );
+    child.wait_until_terminated().await;
+    assert_thread_not_loaded(&harness.manager, child_id).await;
+    harness
+        .control
+        .runtime
+        .request_shutdown()
+        .wait()
+        .await
+        .expect("provisional cleanup releases tree membership");
+}
+
+#[tokio::test]
 async fn spawn_agent_errors_when_manager_dropped() {
     let control = LocalAgentControl::default();
     let (_home, config) = test_config().await;
