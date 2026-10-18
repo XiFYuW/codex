@@ -1444,6 +1444,7 @@ async fn prepare_realtime_start(
             let realtime_api_key = realtime_api_key(auth.as_ref(), &provider)?;
             realtime_request_headers(
                 requested_realtime_session_id.as_deref(),
+                params.voice_session_id.as_deref(),
                 Some(realtime_api_key.as_str()),
                 event_parser,
                 originator.as_str(),
@@ -1453,6 +1454,7 @@ async fn prepare_realtime_start(
         | ConversationStartTransport::ExistingCall { .. } => {
             realtime_request_headers(
                 requested_realtime_session_id.as_deref(),
+                params.voice_session_id.as_deref(),
                 /*api_key*/ None,
                 event_parser,
                 originator.as_str(),
@@ -1668,8 +1670,9 @@ fn realtime_backend_item(text: String, prefix: Option<&str>) -> String {
 fn validate_realtime_voice(version: RealtimeWsVersion, voice: RealtimeVoice) -> CodexResult<()> {
     let voices = RealtimeVoicesList::builtin();
     let allowed = match version {
-        RealtimeWsVersion::V1 | RealtimeWsVersion::V3 => &voices.v1,
+        RealtimeWsVersion::V1 => &voices.v1,
         RealtimeWsVersion::V2 => &voices.v2,
+        RealtimeWsVersion::V3 => &voices.v3,
     };
     if allowed.contains(&voice) {
         return Ok(());
@@ -1950,6 +1953,7 @@ fn realtime_api_key(auth: Option<&CodexAuth>, provider: &ModelProviderInfo) -> C
 
 fn realtime_request_headers(
     realtime_session_id: Option<&str>,
+    voice_session_id: Option<&str>,
     api_key: Option<&str>,
     event_parser: RealtimeEventParser,
     originator: &str,
@@ -1970,6 +1974,12 @@ fn realtime_request_headers(
         && let Ok(realtime_session_id) = HeaderValue::from_str(realtime_session_id)
     {
         headers.insert("x-session-id", realtime_session_id);
+    }
+
+    if let Some(voice_session_id) = voice_session_id
+        && let Ok(voice_session_id) = HeaderValue::from_str(voice_session_id)
+    {
+        headers.insert("voice-session-id", voice_session_id);
     }
 
     if let Some(api_key) = api_key {

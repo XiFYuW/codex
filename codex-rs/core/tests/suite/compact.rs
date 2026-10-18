@@ -1151,6 +1151,128 @@ async fn reasoning_effort_override_remote_v2_compaction_resets_pinned_effort(
     Ok(())
 }
 
+#[test_case::test_case(json!({"input_tokens": 120_000, "output_tokens": 30_000, "total_tokens": 150_000}); "reported_usage")]
+#[test_case::test_case(Value::Null; "missing_usage")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incomplete_response_during_compaction_is_terminal_and_counted(
+    reported_usage: Value,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    for (provider, expected_error) in [
+        (
+            non_openai_model_provider as fn(&MockServer) -> ModelProviderInfo,
+            "Incomplete response returned, reason: max_output_tokens",
+        ),
+        (
+            openai_model_provider,
+            "Error running remote compact task: Incomplete response returned, reason: max_output_tokens",
+        ),
+    ] {
+        let server = start_mock_server().await;
+        let previous_model = "gpt-5.4";
+        let selected_model = "gpt-5.2";
+        let response_mock = mount_sse_sequence(
+            &server,
+            vec![
+                sse(vec![
+                    ev_assistant_message("initial", "Initial reply."),
+                    ev_completed_with_tokens("initial", /*total_tokens*/ 120_000),
+                ]),
+                sse(vec![json!({
+                    "type": "response.incomplete",
+                    "response": {
+                        "id": "incomplete-compaction",
+                        "incomplete_details": {"reason": "max_output_tokens"},
+                        "usage": reported_usage
+                    }
+                })]),
+            ],
+        )
+        .await;
+        let model_provider = provider(&server);
+        let test = test_codex()
+            .with_model(previous_model)
+            .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+            .with_config(move |config| {
+                config.model_provider = model_provider;
+                config.model_catalog = Some(ModelsResponse {
+                    models: vec![
+                        model_info_with_context_window(
+                            previous_model,
+                            /*context_window*/ 273_000,
+                        ),
+                        model_info_with_context_window(
+                            selected_model,
+                            /*context_window*/ 125_000,
+                        ),
+                    ],
+                });
+                config.model_provider.stream_max_retries = Some(2);
+                set_test_compact_prompt(config);
+            })
+            .build_with_auto_env(&server)
+            .await?;
+        test.submit_turn("hello").await?;
+        // A smaller selected model forces compaction with the previous model.
+        // An incomplete result must stop both retries and fallback to the selected model.
+        test.codex
+            .start_or_steer_turn(
+                TurnInputRequest::user_input(vec![UserInput::Text {
+                    text: "continue with the smaller model".into(),
+                    text_elements: Vec::new(),
+                }])
+                .with_thread_settings(ThreadSettingsOverrides {
+                    collaboration_mode: Some(CollaborationMode {
+                        mode: ModeKind::Default,
+                        settings: Settings {
+                            model: selected_model.to_string(),
+                            reasoning_effort: None,
+                            developer_instructions: None,
+                        },
+                    }),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        let mut errors = Vec::new();
+        wait_for_event(&test.codex, |event| {
+            match event {
+                EventMsg::Error(error) => errors.push(error.message.clone()),
+                EventMsg::StreamError(value) => panic!("unexpected compaction retry: {value:?}"),
+                EventMsg::RawResponseCompleted(value) => {
+                    panic!("incomplete response marked complete: {value:?}")
+                }
+                _ => {}
+            }
+            matches!(event, EventMsg::TurnComplete(_))
+        })
+        .await;
+        assert_eq!(errors, vec![expected_error]);
+        assert_eq!(
+            test.codex
+                .token_usage_info()
+                .await
+                .expect("partial usage")
+                .total_token_usage
+                .total_tokens,
+            if reported_usage.is_null() {
+                120_000
+            } else {
+                270_000
+            },
+        );
+        assert_eq!(
+            response_mock
+                .requests()
+                .iter()
+                .map(|request| request.body_json()["model"].clone())
+                .collect::<Vec<_>>(),
+            vec![json!(previous_model), json!(previous_model)],
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manual_compact_records_durable_and_local_token_usage() {
     skip_if_no_network!();
@@ -5787,6 +5909,7 @@ async fn remote_v2_compaction_refreshes_instructions_and_preserves_them_on_cold_
     )?;
     let mut builder = test_codex()
         .with_home(Arc::clone(&home))
+        .with_model_info_override("gpt-5.5", |model| model.use_responses_lite = true)
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing());
     let test = builder.build(&server).await?;
 
@@ -5846,6 +5969,7 @@ async fn remote_v2_compaction_refreshes_instructions_and_preserves_them_on_cold_
     let resumed_cwd = test.config.cwd.clone();
     let mut resume_builder = test_codex()
         .with_home(Arc::clone(&home))
+        .with_model_info_override("gpt-5.5", |model| model.use_responses_lite = true)
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_config(move |config| config.cwd = resumed_cwd);
     let resumed = resume_builder
@@ -5861,7 +5985,7 @@ async fn remote_v2_compaction_refreshes_instructions_and_preserves_them_on_cold_
     assert_single_instruction_fragment(&requests[3], &new_fragment);
     let resumed_input = requests[3].input();
     assert_eq!(
-        resumed_input.get(1..=replacement_history.len()),
+        resumed_input.get(2..=replacement_history.len() + 1),
         Some(replacement_history.as_slice()),
         "remote-v2 cold resume should replay persisted replacement history verbatim"
     );

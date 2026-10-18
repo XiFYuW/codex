@@ -34,6 +34,9 @@ use codex_analytics::CompactionStatus;
 use codex_analytics::CompactionStrategy;
 use codex_analytics::CompactionTrigger;
 use codex_analytics::now_unix_seconds;
+use codex_context_fragments::AnnotatedContent;
+use codex_context_fragments::set_annotated_content;
+use codex_context_fragments::truncate_annotated_text;
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
 use codex_protocol::ResponseItemId;
@@ -52,15 +55,17 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
 use codex_rollout_trace::InferenceTraceContext;
-use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_token_count;
-use codex_utils_output_truncation::truncate_text;
 use futures::prelude::*;
 use tracing::error;
 
 pub use codex_prompts::SUMMARIZATION_PROMPT;
 pub use codex_prompts::SUMMARY_PREFIX;
 const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
+
+/// Thread-local policy that preserves inherited context without changing model or skill budgets.
+/// Insert into `StartThreadOptions::thread_extension_init` to disable automatic compaction.
+pub struct AutoCompactionDisabled;
 
 /// Metadata for a new compaction checkpoint, kept separate from its replacement history.
 ///
@@ -332,7 +337,13 @@ async fn run_compact_task_inner_impl(
             {
                 return Err(err);
             }
-            Err(e) if matches!(e.details(), CodexErrorDetails::SessionBudgetExceeded) => {
+            Err(e)
+                if matches!(
+                    e.details(),
+                    CodexErrorDetails::SessionBudgetExceeded
+                        | CodexErrorDetails::ResponseIncomplete(_)
+                ) =>
+            {
                 return Err(e);
             }
             Err(e) if matches!(e.details(), CodexErrorDetails::ContextWindowExceeded) => {
@@ -538,7 +549,7 @@ pub fn content_items_to_text(content: &[ContentItem]) -> Option<String> {
     let mut pieces = Vec::new();
     for item in content {
         match item {
-            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+            ContentItem::InputText { text } | ContentItem::OutputText { text, .. } => {
                 if !text.is_empty() {
                     pieces.push(text.as_str());
                 }
@@ -555,8 +566,8 @@ pub fn content_items_to_text(content: &[ContentItem]) -> Option<String> {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CompactedUserMessage<'a> {
-    // Flattened text is only for the existing budget and truncation policy.
-    // Whole text messages retain their exact content parts and annotations.
+    // Flattened text is only for budgeting and recognizing summaries. The
+    // output is built from original parts, never reconstructed from this text.
     // Borrow from the history snapshot until selected output is materialized.
     message: String,
     original: &'a ResponseItem,
@@ -602,11 +613,26 @@ pub(crate) fn is_summary_message(message: &str) -> bool {
     message.starts_with(format!("{SUMMARY_PREFIX}\n").as_str())
 }
 
+pub(crate) fn is_real_user_or_agent_message(item: &ResponseItem) -> bool {
+    if let ResponseItem::AgentMessage { content, .. } = item {
+        return !matches!(
+            content.first(),
+            Some(AgentMessageInputContent::InputText { text })
+                if text.starts_with("Message Type: FINAL_ANSWER\n")
+        );
+    }
+    matches!(item, ResponseItem::Message { role, .. } if role == "user")
+        && matches!(
+            crate::event_mapping::parse_turn_item(item),
+            Some(TurnItem::UserMessage(user)) if !is_summary_message(&user.message())
+        )
+}
+
 /// Inserts canonical initial context into compacted replacement history at the
 /// model-expected boundary.
 ///
 /// Placement rules:
-/// - Prefer immediately before the last real user or agent message.
+/// - Prefer immediately before the last real user, agent message, or retained standalone output.
 /// - If no real user messages remain, insert before the compaction summary so
 ///   the summary stays last.
 /// - If there are no user messages, insert before the last compaction item so
@@ -619,27 +645,20 @@ pub(crate) fn insert_initial_context_before_last_real_user_or_summary(
     let mut last_user_or_summary_index = None;
     let mut last_real_user_index = None;
     for (i, item) in compacted_history.iter().enumerate().rev() {
-        if let ResponseItem::AgentMessage { content, .. } = &item.item
-            && !matches!(
-                content.first(),
-                Some(AgentMessageInputContent::InputText { text })
-                    if text.starts_with("Message Type: FINAL_ANSWER\n")
-            )
+        if crate::compact_retained_tool_outputs::is_retained_tool_output(item)
+            || is_real_user_or_agent_message(&item.item)
         {
             last_real_user_index = Some(i);
             break;
         }
-        let Some(TurnItem::UserMessage(user)) = crate::event_mapping::parse_turn_item(&item.item)
-        else {
-            continue;
-        };
         // Compaction summaries are encoded as user messages, so track both:
         // the last real user message (preferred insertion point) and the last
         // user-message-like item (fallback summary insertion point).
-        last_user_or_summary_index.get_or_insert(i);
-        if !is_summary_message(&user.message()) {
-            last_real_user_index = Some(i);
-            break;
+        if matches!(
+            crate::event_mapping::parse_turn_item(&item.item),
+            Some(TurnItem::UserMessage(_))
+        ) {
+            last_user_or_summary_index.get_or_insert(i);
         }
     }
     let last_compaction_index = compacted_history
@@ -706,39 +725,65 @@ fn build_compacted_history_with_limit(
             else {
                 continue;
             };
-            let mut passthrough = internal_chat_message_metadata_passthrough.clone();
             let mut harness_metadata = message.harness_metadata.cloned();
-            let content = if tokens <= remaining
+            let preserve_content = tokens <= remaining
                 && content
                     .iter()
-                    .all(|part| matches!(part, ContentItem::InputText { .. }))
-            {
-                content.clone()
-            } else {
-                // Rebuild only the text fallback; never clone discarded media.
-                if let Some(kinds) = passthrough
-                    .as_mut()
-                    .and_then(|metadata| metadata.content_item_kinds.as_mut())
-                {
-                    *kinds = vec![ContentItemKind("user.text".to_owned())];
-                }
-                vec![ContentItem::InputText {
-                    text: truncate_text(&message.message, TruncationPolicy::Tokens(remaining)),
-                }]
+                    .all(|part| matches!(part, ContentItem::InputText { .. }));
+            let mut item = ResponseItem::Message {
+                status: None,
+                encrypted_content: None,
+                id: id.clone(),
+                role: "user".to_owned(),
+                content: if preserve_content {
+                    content.clone()
+                } else {
+                    Vec::new()
+                },
+                phase: None,
+                internal_chat_message_metadata_passthrough:
+                    internal_chat_message_metadata_passthrough.clone(),
             };
+            if !preserve_content {
+                // Select text and its annotations by the same source index.
+                // Do not clone discarded images/audio or infer their text's source.
+                let metadata = internal_chat_message_metadata_passthrough.as_ref();
+                let mut parts: Vec<_> = crate::event_mapping::user_input_parts(content)
+                    .filter_map(|(index, part)| {
+                        let ContentItem::InputText { text } = part else {
+                            return None;
+                        };
+                        let kind = metadata
+                            .and_then(|metadata| metadata.content_item_kinds.as_ref())
+                            .and_then(|kinds| kinds.get(index))
+                            .cloned()
+                            .unwrap_or_else(|| ContentItemKind("unknown".to_string()));
+                        let source = metadata
+                            .and_then(|metadata| metadata.content_item_metadata.as_ref())
+                            .and_then(|sources| sources.get(index))
+                            .cloned()
+                            .unwrap_or_default();
+                        Some(AnnotatedContent::text(text, kind, source))
+                    })
+                    .collect();
+                if parts.is_empty() {
+                    // Preserve the existing empty-text fallback for media-only input.
+                    parts.push(AnnotatedContent::new(
+                        ContentItem::InputText {
+                            text: String::new(),
+                        },
+                        ContentItemKind("unknown".to_string()),
+                    ));
+                }
+                set_annotated_content(&mut item, truncate_annotated_text(parts, remaining));
+            }
             if tokens > remaining
                 && let Some(metadata) = &mut harness_metadata
             {
                 metadata.mark_retained_sources_incomplete();
             }
             selected_messages.push(ResponseItemEnvelope {
-                item: ResponseItem::Message {
-                    id: id.clone(),
-                    role: "user".to_owned(),
-                    content,
-                    phase: None,
-                    internal_chat_message_metadata_passthrough: passthrough,
-                },
+                item,
                 metadata: harness_metadata,
             });
             if tokens > remaining {
@@ -850,7 +895,18 @@ async fn drain_to_completed(
                 });
             }
             Ok(_) => continue,
-            Err(e) => return Err(e),
+            Err(e) => {
+                if let CodexErrorDetails::ResponseIncomplete(incomplete) = e.details() {
+                    sess.record_incomplete_response_usage(
+                        turn_context,
+                        &turn_context.initial_settings,
+                        incomplete,
+                    )
+                    .await;
+                    sess.send_token_count_event(turn_context).await;
+                }
+                return Err(e);
+            }
         }
     }
 }

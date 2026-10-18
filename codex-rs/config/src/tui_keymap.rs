@@ -134,6 +134,8 @@ impl KeybindingsSpec {
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct TuiGlobalKeymap {
+    /// Prefix for persistent, context-aware shortcut menus.
+    pub leader: Option<KeybindingsSpec>,
     /// Open the shared agent-session overview.
     pub open_agents: Option<KeybindingsSpec>,
     /// Open the transcript overlay.
@@ -574,7 +576,7 @@ pub struct TuiKeymap {
 
 /// Normalize one user-entered key spec into canonical storage format.
 ///
-/// The output always orders modifiers as `ctrl-alt-shift-<key>` when present
+/// The output always orders modifiers as `ctrl-alt-shift-super-<key>` when present
 /// and applies accepted aliases (`escape` -> `esc`, `pageup` -> `page-up`).
 /// Inputs that cannot be represented unambiguously are rejected.
 ///
@@ -592,6 +594,17 @@ fn normalize_keybinding_spec(raw: &str) -> Result<String, String> {
             "invalid keybinding `{raw}`: key chords may contain at most \
 {MAX_KEY_CHORD_STROKES} strokes (for example `ctrl-x ctrl-s`)."
         ));
+    }
+
+    if strokes[0].eq_ignore_ascii_case("leader") {
+        let [_, completion] = strokes.as_slice() else {
+            return Err(format!(
+                "invalid keybinding `{raw}`: `leader` must be followed by one key \
+(for example `leader c`)."
+            ));
+        };
+        return normalize_keybinding_stroke(completion)
+            .map(|completion| format!("leader {completion}"));
     }
 
     strokes
@@ -622,8 +635,12 @@ See the Codex keymap documentation for supported actions and examples."
         ));
     }
 
-    let mut modifiers =
-        BTreeMap::<&str, bool>::from([("ctrl", false), ("alt", false), ("shift", false)]);
+    let mut modifiers = BTreeMap::<&str, bool>::from([
+        ("ctrl", false),
+        ("alt", false),
+        ("shift", false),
+        ("super", false),
+    ]);
     let mut key_segments = Vec::new();
     let mut saw_key = false;
 
@@ -632,6 +649,7 @@ See the Codex keymap documentation for supported actions and examples."
             "ctrl" | "control" => Some("ctrl"),
             "alt" | "option" => Some("alt"),
             "shift" => Some("shift"),
+            "super" | "cmd" | "command" => Some("super"),
             _ => None,
         };
 
@@ -655,10 +673,12 @@ See the Codex keymap documentation for supported actions and examples."
         ));
     }
 
-    if key_segments
-        .iter()
-        .any(|segment| matches!(*segment, "ctrl" | "control" | "alt" | "option" | "shift"))
-    {
+    if key_segments.iter().any(|segment| {
+        matches!(
+            *segment,
+            "ctrl" | "control" | "alt" | "option" | "shift" | "super" | "cmd" | "command"
+        )
+    }) {
         return Err(format!(
             "invalid keybinding `{raw}`: modifiers must come before the key (for example `ctrl-a`)."
         ));
@@ -674,6 +694,9 @@ See the Codex keymap documentation for supported actions and examples."
     }
     if modifiers.get("shift").copied().unwrap_or(false) {
         normalized.push("shift".to_string());
+    }
+    if modifiers.get("super").copied().unwrap_or(false) {
+        normalized.push("super".to_string());
     }
     normalized.push(key);
     Ok(normalized.join("-"))
@@ -894,6 +917,16 @@ mod tests {
         assert_eq!(normalize_keybinding_spec("F13"), Ok("f13".to_string()));
         assert_eq!(normalize_keybinding_spec("f24"), Ok("f24".to_string()));
         assert!(normalize_keybinding_spec("f25").is_err());
+    }
+
+    #[test]
+    fn command_modifier_aliases_normalize_to_super() {
+        for spec in ["cmd-left", "command-left", "super-left"] {
+            assert_eq!(
+                normalize_keybinding_spec(spec),
+                Ok("super-left".to_string())
+            );
+        }
     }
 }
 

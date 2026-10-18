@@ -34,6 +34,7 @@ use codex_prompts::ResolvedModelMessages;
 use codex_prompts::render_model_instructions;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::BaseInstructionsProvenance;
+use codex_protocol::models::ContentItemNamespace;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_tools::ToolName;
 
@@ -147,6 +148,7 @@ impl Session {
             let specs = step_context.tool_router.model_visible_specs();
             let definitions = codex_tools::create_tools_json_for_responses_lite(&specs)?;
             world_state.add_section(TopLevelToolsState::new(
+                model_messages.incremental_tools(),
                 definitions,
                 Some(Arc::clone(&extension_metrics)),
             )?);
@@ -173,7 +175,6 @@ impl Session {
                 window_ids.first_window_id,
                 window_ids.previous_window_id,
                 window_ids.window_id,
-                /*thread_hint*/ None,
             ));
         }
         let guidance = step_context
@@ -264,15 +265,18 @@ impl Session {
             ));
         }
         if turn_context.config.include_environment_context {
-            let current_date = self
-                .read_clock_for_context(turn_context, "environment_date")
-                .await?
-                .map(|current_time| {
-                    current_time
-                        .with_timezone(&chrono::Local)
-                        .format("%Y-%m-%d")
-                        .to_string()
-                });
+            let current_date = if turn_context.config.include_environment_context_time {
+                self.read_clock_for_context(turn_context, "environment_date")
+                    .await?
+                    .map(|current_time| {
+                        current_time
+                            .with_timezone(&chrono::Local)
+                            .format("%Y-%m-%d")
+                            .to_string()
+                    })
+            } else {
+                None
+            };
             world_state.add_section(
                 EnvironmentsState::from_turn_context_with_environments(
                     turn_context,
@@ -331,6 +335,9 @@ impl Session {
         for contributor in self.services.extensions.context_contributors() {
             for section in contributor
                 .contribute_world_state(WorldStateContributionInput {
+                    executor_capability_discovery_v2: step_context
+                        .executor_capability_discovery_v2
+                        .as_deref(),
                     thread_id: self.thread_id(),
                     turn_id: turn_context.sub_id.as_str(),
                     model_info: &step_context.settings.model_info,
@@ -351,11 +358,20 @@ impl Session {
                 world_state.add_extension_section(section);
             }
         }
+        let v2_namespace = turn_context
+            .config
+            .multi_agent_v2
+            .tool_namespace
+            .clone()
+            .map(ContentItemNamespace::from)
+            .unwrap_or(ContentItemNamespace::Functions);
         let mut multi_agent_mode = MultiAgentModeState::new(
             super::multi_agents::effective_multi_agent_mode(step_context),
-        );
+        )
+        .with_namespace(v2_namespace.clone());
         if let Some(usage_hint_text) = super::multi_agents::usage_hint_text(step_context) {
-            let usage_hint = MultiAgentUsageHintState::new(usage_hint_text);
+            let usage_hint =
+                MultiAgentUsageHintState::new(usage_hint_text).with_namespace(v2_namespace.clone());
             multi_agent_mode = multi_agent_mode.with_usage_hint(&usage_hint);
             world_state.add_section(usage_hint);
         }
@@ -392,7 +408,12 @@ impl Session {
                 )
             } else {
                 ModelCatalogState::default()
-            },
+            }
+            .with_namespace(match turn_context.multi_agent_version {
+                MultiAgentVersion::Disabled => None,
+                MultiAgentVersion::V1 => Some(ContentItemNamespace::MultiAgentV1),
+                MultiAgentVersion::V2 => Some(v2_namespace),
+            }),
         );
         if !crate::guardian::is_basic_session_source(&turn_context.session_source) {
             world_state.add_section(ManagedDeveloperInstructionsState::new(

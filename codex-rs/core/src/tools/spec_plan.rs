@@ -88,7 +88,6 @@ use codex_tools::ToolExecutor;
 use codex_tools::ToolExposures;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
-use codex_tools::UnifiedExecShellMode;
 use codex_tools::can_request_original_image_detail;
 use codex_tools::collect_code_mode_exec_prompt_tool_definitions;
 use codex_tools::collect_request_plugin_install_entries;
@@ -543,33 +542,14 @@ pub(crate) fn finalize_tool_router(
         .filter(|info| !info.is_empty());
     let child_management_tools = required_child_management_tool_names(turn_context, model_info);
 
-    let router = ToolRouter::from_parts(
+    Ok(ToolRouter::from_parts(
         registry,
         model_visible_specs,
         tool_mode,
         code_mode_tool_names,
         tool_namespaces_info,
         &child_management_tools,
-    );
-    // Internal workers can inherit MAv2 configuration without using the board.
-    if multi_agent_v2_enabled(turn_context)
-        && collab_tools_enabled(turn_context, model_info)
-        && turn_context.config.multi_agent_v2.disable_direct_message
-        && !turn_context.session_source.is_internal()
-    {
-        let post_tool = ToolName::new(
-            turn_context.config.multi_agent_v2.tool_namespace.clone(),
-            "post",
-        );
-        if !router.exposes_tool(&post_tool) {
-            return Err(CodexErrorDetails::InvalidRequest(
-                "disable_direct_message requires an available agent message board in this session"
-                    .to_owned(),
-            )
-            .into());
-        }
-    }
-    Ok(router)
+    ))
 }
 
 fn apply_direct_model_only_namespace_overrides(
@@ -753,8 +733,9 @@ fn collab_tools_enabled(turn_context: &TurnContext, model_info: &ModelInfo) -> b
             turn_context.config.agent_max_depth,
         ),
         MultiAgentVersion::V2 => {
-            turn_context.session_source.get_agent_path().is_none()
-                || model_info.multi_agent_version == Some(MultiAgentVersion::V2)
+            !turn_context.config.multi_agent_v2.disable_native_tools
+                && (turn_context.session_source.get_agent_path().is_none()
+                    || model_info.multi_agent_version == Some(MultiAgentVersion::V2))
         }
     }
 }
@@ -1287,15 +1268,7 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, registry: &mut ToolRegistr
                 .environments
                 .turn_environments()
                 .any(|environment| environment.config().allow_login_shell),
-        include_shell_parameter: stable_environment_tools
-            || !matches!(
-                &turn_context.unified_exec_shell_mode,
-                UnifiedExecShellMode::ZshFork(_)
-            )
-            || context
-                .environments
-                .turn_environments()
-                .any(|environment| environment.environment.is_remote()),
+        include_shell_parameter: true,
         allow_tty: features.enabled(Feature::UnifiedExecTty),
         exec_permission_approvals_enabled,
         include_environment_id,

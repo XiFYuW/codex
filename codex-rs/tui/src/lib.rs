@@ -9,11 +9,14 @@ use crate::legacy_core::config::ConfigBuilder;
 use crate::legacy_core::config::ConfigOverrides;
 use crate::legacy_core::config::ConfigTomlLoadResult;
 use crate::legacy_core::config::bootstrap_auth_config;
+use crate::legacy_core::config::edit::ConfigEdit;
+use crate::legacy_core::config::edit::ConfigEditsBuilder;
 use crate::legacy_core::config::load_config_toml_with_layer_stack;
 #[cfg(test)]
 use crate::legacy_core::config::resolve_bootstrap_http_client_factory;
 use crate::legacy_core::config::resolve_oss_provider;
 use crate::legacy_core::config::resolve_profile_v2_config_path;
+use crate::onboarding::check_gov_cloud;
 use crate::session_resume::ResolveCwdOutcome;
 use crate::session_resume::ResumeCwdContext;
 use crate::session_resume::effective_resume_cwd_mode;
@@ -101,6 +104,7 @@ pub(crate) use codex_app_server_client::legacy_core;
 
 pub(crate) use worktree_startup::ManagedTuiWorktree;
 
+mod activation_key_guard;
 mod additional_dirs;
 mod analytics;
 mod app;
@@ -125,6 +129,7 @@ mod clipboard_paste;
 mod clock_format;
 mod collaboration_modes;
 mod color;
+mod config_panel;
 mod config_update;
 mod copy_input_guard;
 pub(crate) mod custom_terminal;
@@ -161,6 +166,7 @@ mod inline_visualization;
 pub(crate) mod insert_history;
 mod managed_worktree_tool_specs;
 mod managed_worktree_tools;
+mod terminal_program_status;
 pub use insert_history::insert_history_lines;
 mod footer_hint;
 mod key_hint;
@@ -169,6 +175,7 @@ mod keymap_setup;
 mod line_truncation;
 pub(crate) mod live_wrap;
 mod local_settings;
+mod rendered_selection;
 pub use live_wrap::RowBuilder;
 mod local_chatgpt_auth;
 mod managed_new_thread_defaults;
@@ -267,6 +274,7 @@ pub(crate) mod test_backend;
 pub(crate) mod test_support;
 
 use crate::onboarding::onboarding_screen::OnboardingScreenArgs;
+use crate::onboarding::onboarding_screen::run_gov_cloud_guidance;
 use crate::onboarding::onboarding_screen::run_onboarding_app;
 use crate::startup_hooks_review::StartupHooksReviewOutcome;
 use crate::startup_hooks_review::load_startup_hooks_review_entry;
@@ -1150,6 +1158,7 @@ async fn run_ratatui_app(
     embedded_network_policy: codex_app_server_client::EmbeddedNetworkPolicy,
     managed_worktree: Option<ManagedTuiWorktree>,
     daemon_startup_warning: Option<String>,
+    managed_daemon: bool,
     launch_telemetry: daemon_telemetry::Launch<impl FnOnce(&AppServerTarget, bool)>,
     startup_draft: startup_draft::StartupDraft,
 ) -> color_eyre::Result<AppExitInfo> {
@@ -1815,6 +1824,22 @@ async fn run_ratatui_app(
         },
     };
 
+    if let resume_picker::SessionSelection::Resume(target) = &session_selection {
+        let validation = startup_draft
+            .run_until(
+                &mut tui,
+                session_resume::validate_resume_target(&mut app_server, target.thread_id),
+            )
+            .await;
+        if let Err(err) = validation
+            .map_err(color_eyre::Report::from)
+            .and_then(|result| result)
+        {
+            shutdown_startup_session(Some(app_server), &mut terminal_restore_guard).await;
+            return Err(err);
+        }
+    }
+
     // Remote startup keeps its existing explicit --cd trust check. Resolving other
     // remote folders requires authoritative project-root information from the server.
     if !uses_remote_workspace || remote_cwd_override.is_some() {
@@ -2000,6 +2025,11 @@ async fn run_ratatui_app(
         &session_selection,
         &loader_overrides,
     );
+    // Connected servers resolve their own provider; the local config may differ.
+    let check_gov_cloud_guidance = config.notices.hide_gov_cloud_guidance != Some(true)
+        && (config.model_provider.is_amazon_bedrock()
+            || !matches!(app_server_target, AppServerTarget::Embedded));
+    let guidance_request_handle = app_server.request_handle();
     let startup_prefetch_started_at = Instant::now();
     let startup_prefetch = startup_draft
         .run_until(&mut tui, async {
@@ -2015,10 +2045,13 @@ async fn run_ratatui_app(
                     Ok(Some(bootstrap))
                 },
                 load_startup_hooks_review_entry(hooks_request_handle, hooks_cwd),
+                async {
+                    check_gov_cloud_guidance && check_gov_cloud(guidance_request_handle).await
+                },
             )
         })
         .await;
-    let (startup_bootstrap, startup_hooks_entry) = match startup_prefetch {
+    let (startup_bootstrap, startup_hooks_entry, show_gov_cloud_guidance) = match startup_prefetch {
         Ok(startup_prefetch) => startup_prefetch,
         Err(err) => {
             shutdown_startup_session(Some(app_server), &mut terminal_restore_guard).await;
@@ -2037,6 +2070,22 @@ async fn run_ratatui_app(
         }
     };
     let startup_elapsed_before_app = startup_prefetch_started_at.elapsed();
+    if show_gov_cloud_guidance {
+        if let Err(err) = run_gov_cloud_guidance(&mut tui).await {
+            shutdown_startup_session(Some(app_server), &mut terminal_restore_guard).await;
+            return Err(err);
+        }
+        if let Err(err) = ConfigEditsBuilder::for_config(&config)
+            .with_edits([ConfigEdit::SetPath {
+                segments: vec!["notice".into(), "hide_gov_cloud_guidance".into()],
+                value: toml_edit::value(true),
+            }])
+            .apply()
+            .await
+        {
+            tracing::warn!(%err, "Failed to save GovCloud guidance acknowledgment");
+        }
+    }
     let startup_hooks_review = maybe_run_startup_hooks_review(
         &mut app_server,
         &mut tui,
@@ -2078,6 +2127,7 @@ async fn run_ratatui_app(
         startup_bootstrap,
         startup_hooks_browser,
         daemon_startup_warning,
+        managed_daemon,
         startup_draft,
         managed_worktree,
         daemon_cli_executable,
@@ -2695,6 +2745,52 @@ requires_openai_auth = {requires_openai_auth}
             Default::default(),
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn startup_resume_rejects_guardian_thread() -> color_eyre::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let config = build_config(&temp_dir).await?;
+        let thread_id = write_session_rollout(
+            temp_dir.path(),
+            "2025-01-05T12-00-00",
+            "2025-01-05T12:00:00Z",
+            "Guardian review",
+            &config.model_provider_id,
+            config.cwd.as_path(),
+        )?;
+        let rollout_path = temp_dir
+            .path()
+            .join("sessions/2025/01/05")
+            .join(format!("rollout-2025-01-05T12-00-00-{thread_id}.jsonl"));
+        let rollout = std::fs::read_to_string(&rollout_path)?;
+        let (meta, history) = rollout.split_once('\n').expect("rollout has metadata");
+        let mut meta: serde_json::Value = serde_json::from_str(meta)?;
+        meta["payload"]["source"] = serde_json::json!({"subagent": {"other": "guardian"}});
+        meta["payload"]["parent_thread_id"] =
+            serde_json::json!("00000000-0000-0000-0000-000000000001");
+        std::fs::write(&rollout_path, format!("{meta}\n{history}"))?;
+
+        let state_db =
+            init_state_db_for_app_server_target(&config, &AppServerTarget::Embedded).await?;
+        let mut app_server = start_app_server_for_picker(
+            &config,
+            &AppServerTarget::Embedded,
+            Vec::new(),
+            LoaderOverrides::without_managed_config_for_tests(),
+            state_db,
+            Arc::new(EnvironmentManager::default_for_tests()),
+        )
+        .await?;
+        let error = session_resume::validate_resume_target(&mut app_server, thread_id)
+            .await
+            .expect_err("Guardian resume should be rejected");
+        insta::assert_snapshot!(error.to_string(), @"
+        Cannot resume a Guardian review thread.
+        Resume its parent session instead: codex resume 00000000-0000-0000-0000-000000000001
+        ");
+        app_server.shutdown().await?;
+        Ok(())
     }
 
     #[tokio::test]

@@ -2,6 +2,7 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -53,13 +54,14 @@ use serde_json::json;
 use tempfile::TempDir;
 
 use super::LocalThreadStore;
+use super::MigrationLocks;
 use super::RolloutMigrationFailureReason;
 use super::RolloutMigrationMode;
 use super::RolloutMigrationOptions;
 use super::RolloutMigrationPaths;
 use super::RolloutMigrationProgress;
 use super::RolloutMigrationStatus;
-#[cfg(unix)]
+use super::compress_rollout_to_path;
 use super::decompress_rollout_to_path;
 use super::migration_journal_path;
 use super::telemetry::RolloutMigrationTrigger;
@@ -174,6 +176,8 @@ fn agent_message(text: &str) -> RolloutItem {
 
 fn input_response_message(role: &str, text: &str) -> ResponseItem {
     ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: role.to_string(),
         content: vec![ContentItem::InputText {
@@ -473,6 +477,7 @@ async fn migration_projects_explicit_and_implicit_legacy_completed_items() {
     assert_eq!(turns.turns[0].turn_id, "explicit");
     let items = store
         .list_items(ListItemsParams {
+            item_ids: None,
             thread_id,
             turn_id: None,
             include_archived: false,
@@ -625,6 +630,7 @@ async fn migration_keeps_late_completions_in_their_original_turn() {
 
     let items = store
         .list_items(ListItemsParams {
+            item_ids: None,
             thread_id,
             turn_id: None,
             include_archived: false,
@@ -933,6 +939,8 @@ async fn migration_coalesces_response_first_user_message_rollback_boundary() {
     let thread_id = ThreadId::new();
     let file_id = "file_123".to_string();
     let response = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![
@@ -1105,6 +1113,7 @@ async fn migration_keeps_late_completions_for_surviving_turns_across_rollback() 
     );
     let items = store
         .list_items(ListItemsParams {
+            item_ids: None,
             thread_id,
             turn_id: None,
             include_archived: false,
@@ -1180,9 +1189,13 @@ async fn migration_rolls_back_pre_compaction_turns_from_sqlite_history() {
     let RolloutItem::Compacted(mut checkpoint) = compacted(vec![
         input_response_message("user", "old question"),
         ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "assistant".to_string(),
             content: vec![ContentItem::OutputText {
+                annotations: None,
+                logprobs: None,
                 text: "old answer".to_string(),
             }],
             phase: None,
@@ -1581,7 +1594,7 @@ async fn migration_keeps_downgraded_delivery_before_later_same_turn_steer() {
         RolloutItem::ResponseItem(envelope)
             if matches!(&envelope.item, ResponseItem::Message { role, content, .. }
                 if role == "assistant"
-                    && matches!(content.as_slice(), [ContentItem::OutputText { text }]
+                    && matches!(content.as_slice(), [ContentItem::OutputText { text , .. }]
                         if text == "May I publish?"))
     )));
 }
@@ -1637,6 +1650,8 @@ async fn assert_migrated_evidence_order(steer_order: Option<u64>) {
     let thread_id = ThreadId::new();
     let [initial, steer] =
         [("initial", INITIAL), ("steer", STEER)].map(|(id, text)| ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: Some(ResponseItemId::with_suffix("msg", id)),
             role: "user".to_owned(),
             content: vec![ContentItem::InputText {
@@ -2075,6 +2090,8 @@ async fn migration_compacts_subagent_prefix_and_does_not_project_it() {
                 message: "latest checkpoint".to_string(),
                 replacement_history: Some(vec![
                     ResponseItem::Message {
+                        encrypted_content: None,
+                        status: None,
                         id: None,
                         role: "user".to_string(),
                         content: vec![ContentItem::InputText {
@@ -2657,31 +2674,116 @@ async fn migration_repairs_a_missing_paginated_name_when_rerun() {
     );
 }
 
-#[cfg(unix)]
-#[tokio::test]
-async fn decompression_temporaries_are_owner_only() {
-    let home = TempDir::new().expect("create Codex home");
-    let thread_id = ThreadId::new();
-    let compressed_path = compress_rollout(&write_rollout(
-        home.path(),
-        thread_id,
-        SessionSource::Cli,
-        vec![user_message("compressed question")],
-    ));
-    let plain_path = home.path().join("decompressed.tmp");
+#[test]
+fn cancelled_compression_workers_hold_migration_locks() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .expect("build runtime");
+    runtime.block_on(async {
+        for compress in [true, false] {
+            let home = TempDir::new().expect("create Codex home");
+            let thread_id = ThreadId::new();
+            let plain_path = home.path().join("rollout.jsonl");
+            let compressed_path = home.path().join("rollout.jsonl.zst");
+            let contents = b"rollout contents\n";
+            fs::write(&plain_path, contents).expect("write plain rollout");
+            if !compress {
+                compress_rollout(&plain_path);
+            }
+            let source_path = if compress {
+                &plain_path
+            } else {
+                &compressed_path
+            };
+            let permissions = fs::metadata(source_path)
+                .expect("source metadata")
+                .permissions();
+            let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+            let locks = Arc::new(MigrationLocks {
+                _maintenance: Some(Arc::new(
+                    codex_rollout::try_acquire_rollout_maintenance_lock(home.path())
+                        .expect("acquire maintenance lock")
+                        .expect("maintenance lock is available"),
+                )),
+                _writer: store
+                    .acquire_writer_lock(thread_id)
+                    .expect("acquire writer lock"),
+                _live_writer: store.live_writer_locks.lock(thread_id).await,
+            });
+            let coordination = store.live_writer_locks.coordination(thread_id).await;
 
-    decompress_rollout_to_path(&compressed_path, &plain_path)
-        .await
-        .expect("decompress rollout");
+            // Hold the only blocking thread so the real file worker stays queued across cancellation.
+            let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = reached_tx.send(());
+                // Dropping the sender after a failed assertion also lets runtime teardown finish.
+                let _ = resume_rx.recv();
+            });
+            reached_rx.await.expect("blocking thread occupied");
+            let mut work = Box::pin(async {
+                if compress {
+                    compress_rollout_to_path(
+                        &plain_path,
+                        &compressed_path,
+                        permissions,
+                        /*modified_at*/ None,
+                        &locks,
+                    )
+                    .await
+                } else {
+                    decompress_rollout_to_path(&compressed_path, &plain_path, &locks).await
+                }
+            });
+            assert!(futures::poll!(&mut work).is_pending());
+            drop(work);
+            drop(locks);
 
-    assert_eq!(
-        fs::metadata(&plain_path)
-            .expect("read temporary metadata")
-            .permissions()
-            .mode()
-            & 0o777,
-        0o600
-    );
+            assert!(
+                codex_rollout::try_acquire_rollout_maintenance_lock(home.path())
+                    .expect("probe maintenance lock")
+                    .is_none()
+            );
+            assert!(matches!(
+                store.acquire_writer_lock(thread_id),
+                Err(ThreadStoreError::Conflict { .. })
+            ));
+            assert!(coordination.writer.try_lock().is_err());
+
+            drop(resume_tx);
+            blocker.await.expect("release blocking thread");
+            // This guard is released last, after the worker's file I/O and other locks.
+            let _live_writer_guard = coordination.writer.lock().await;
+            assert!(
+                codex_rollout::try_acquire_rollout_maintenance_lock(home.path())
+                    .expect("probe released maintenance lock")
+                    .is_some()
+            );
+            store
+                .acquire_writer_lock(thread_id)
+                .expect("writer lock released");
+            let decoded = if compress {
+                zstd::stream::decode_all(
+                    fs::File::open(&compressed_path).expect("open compressed rollout"),
+                )
+                .expect("decode complete rollout")
+            } else {
+                #[cfg(unix)]
+                assert_eq!(
+                    fs::metadata(&plain_path)
+                        .expect("temporary metadata")
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+                fs::read(&plain_path).expect("read decompressed rollout")
+            };
+            assert_eq!(decoded, contents);
+        }
+    });
 }
 
 #[tokio::test]

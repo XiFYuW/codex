@@ -11,6 +11,7 @@ use anyhow::Result;
 use codex_config::AppToolApproval;
 use codex_protocol::mcp::CallToolResult;
 use codex_protocol::models::PermissionProfile;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use rmcp::model::ListResourceTemplatesResult;
 use rmcp::model::ListResourcesResult;
 use rmcp::model::PaginatedRequestParams;
@@ -256,6 +257,51 @@ impl PreparedMcpCall {
             unreachable!("prepared MCP calls retain their immutable permission authority");
         };
         permission_profile
+    }
+
+    /// Attach policy aliases and the server-host launcher, replacing stale authority.
+    /// Callers negotiate the state capability before requesting this metadata.
+    pub async fn augment_sandbox_metadata(
+        &self,
+        meta: &mut Option<JsonValue>,
+        state: crate::SandboxState,
+    ) -> Result<()> {
+        crate::sandbox_metadata::augment_metadata(
+            meta,
+            state,
+            self.sandbox_codex_executable().await,
+        )
+    }
+
+    /// Full CLI path usable by a local stdio server. An HTTP endpoint (even on
+    /// loopback) or remote executor does not establish a shared filesystem.
+    /// Capability probes are cached process-wide by absolute executable path.
+    pub async fn sandbox_codex_executable(&self) -> Option<AbsolutePathBuf> {
+        let server = self
+            .config
+            .mcp_server_catalog
+            .server(&self.server_name)?
+            .config();
+        if self.server_environment_id() != codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID
+            || !server.is_local_environment()
+            || !matches!(
+                server.transport,
+                codex_config::McpServerTransportConfig::Stdio { .. }
+            )
+        {
+            return None;
+        }
+
+        // Require a literal absolute path before the constructor can expand `~`.
+        let executable = self
+            .config
+            .codex_self_exe
+            .as_deref()
+            .filter(|path| path.is_absolute() && path.to_str().is_some())?;
+        let executable = AbsolutePathBuf::from_absolute_path_checked(executable).ok()?;
+        crate::sandbox_executable::supports_sandbox_state(&executable)
+            .await
+            .then_some(executable)
     }
 
     pub fn server_name(&self) -> &str {
